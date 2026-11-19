@@ -1,0 +1,151 @@
+# Drives Claude from the org project board.
+#
+# Every 5 minutes this looks at the CloudgateStudios project board and:
+#   0. Adds every open issue from any CloudgateStudios repo that isn't on the board yet,
+#      in the STATUS_NEW column (covers new repos automatically)
+#   1. "Ready for Agent"   -> adds the `claude` label to the issue (which wakes the
+#                           Claude workflow in that repo) and moves the card to "In Progress"
+#   2. "In Progress"  -> once the issue has an open PR that closes it, moves the
+#                           card to "Needs Review" and removes the `claude` label
+#
+# GitHub Actions has no trigger for project-board moves, hence the poll.
+#
+# Setup:
+#   - Org variable  CLAUDE_PROJECT_NUMBER = the board's number (from its URL)
+#   - Optional org variables to match your column names (defaults below):
+#       CLAUDE_STATUS_NEW, CLAUDE_STATUS_READY, CLAUDE_STATUS_WORKING, CLAUDE_STATUS_REVIEW
+#   - Org secret    CLAUDE_BOARD_TOKEN    = fine-grained PAT, owner CloudgateStudios,
+#       All repositories; Repository: Issues (read/write), Pull requests (read), Metadata (read);
+#       Organization: Projects (read/write).
+#     A PAT (not GITHUB_TOKEN) is required: labels added with GITHUB_TOKEN don't trigger workflows.
+
+name: Board -> Claude
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: board-dispatch
+  cancel-in-progress: false
+
+env:
+  ORG: CloudgateStudios
+  PROJECT_NUMBER: ${{ vars.CLAUDE_PROJECT_NUMBER || '1' }}
+  STATUS_NEW: ${{ vars.CLAUDE_STATUS_NEW || 'Backlog' }}
+  STATUS_READY: ${{ vars.CLAUDE_STATUS_READY || 'Ready for Agent' }}
+  STATUS_WORKING: ${{ vars.CLAUDE_STATUS_WORKING || 'In Progress' }}
+  STATUS_REVIEW: ${{ vars.CLAUDE_STATUS_REVIEW || 'Needs Review' }}
+  LABEL: claude
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_BOARD_TOKEN }}
+          script: |
+            const { ORG, PROJECT_NUMBER, STATUS_NEW, STATUS_READY, STATUS_WORKING, STATUS_REVIEW, LABEL } = process.env;
+            if (!PROJECT_NUMBER) { core.setFailed('Set the CLAUDE_PROJECT_NUMBER org variable.'); return; }
+
+            // Load project, its Status field and every item (paginated).
+            let project, statusField, items = [], cursor = null;
+            do {
+              const res = await github.graphql(`
+                query($org: String!, $num: Int!, $after: String) {
+                  organization(login: $org) {
+                    projectV2(number: $num) {
+                      id
+                      field(name: "Status") {
+                        ... on ProjectV2SingleSelectField { id options { id name } }
+                      }
+                      items(first: 100, after: $after) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                          id
+                          fieldValueByName(name: "Status") {
+                            ... on ProjectV2ItemFieldSingleSelectValue { name }
+                          }
+                          content {
+                            __typename
+                            ... on Issue {
+                              id number state
+                              repository { name }
+                              labels(first: 30) { nodes { name } }
+                              closedByPullRequestsReferences(first: 5, includeClosedPrs: false) {
+                                nodes { number state }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }`, { org: ORG, num: Number(PROJECT_NUMBER), after: cursor });
+              project = res.organization.projectV2;
+              statusField = project.field;
+              items.push(...project.items.nodes);
+              cursor = project.items.pageInfo.hasNextPage ? project.items.pageInfo.endCursor : null;
+            } while (cursor);
+
+            const optionId = (name) => {
+              const o = statusField.options.find(o => o.name.toLowerCase() === name.toLowerCase());
+              if (!o) throw new Error(`Board has no Status option named "${name}"`);
+              return o.id;
+            };
+            const setStatus = (itemId, name) => github.graphql(`
+              mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $p, itemId: $i, fieldId: $f, value: { singleSelectOptionId: $o }
+                }) { projectV2Item { id } }
+              }`, { p: project.id, i: itemId, f: statusField.id, o: optionId(name) });
+
+            // 0. Auto-add open issues from every org repo that aren't on the board yet.
+            const onBoard = new Set(items.map(it => it.content?.id).filter(Boolean));
+            let added = 0, after = null;
+            do {
+              const r = await github.graphql(`
+                query($q: String!, $after: String) {
+                  search(type: ISSUE, query: $q, first: 100, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes { ... on Issue { id number repository { name } } }
+                  }
+                }`, { q: `org:${ORG} is:issue is:open archived:false`, after });
+              for (const iss of r.search.nodes) {
+                if (!iss.id || onBoard.has(iss.id)) continue;
+                const res = await github.graphql(`
+                  mutation($p: ID!, $c: ID!) {
+                    addProjectV2ItemById(input: { projectId: $p, contentId: $c }) { item { id } }
+                  }`, { p: project.id, c: iss.id });
+                if (STATUS_NEW) await setStatus(res.addProjectV2ItemById.item.id, STATUS_NEW);
+                onBoard.add(iss.id); added++;
+                core.info(`Added ${iss.repository.name}#${iss.number} to the board`);
+              }
+              after = r.search.pageInfo.hasNextPage ? r.search.pageInfo.endCursor : null;
+            } while (after);
+            if (added) core.info(`Added ${added} issue(s)`);
+
+            const status = (it) => it.fieldValueByName?.name ?? '';
+            const issues = items.filter(it => it.content?.__typename === 'Issue' && it.content.state === 'OPEN');
+
+            for (const it of issues) {
+              const iss = it.content;
+              const ref = { owner: ORG, repo: iss.repository.name, issue_number: iss.number };
+              const hasLabel = iss.labels.nodes.some(l => l.name === LABEL);
+
+              if (status(it) === STATUS_READY) {
+                // Re-apply the label so a fresh `labeled` event always fires.
+                if (hasLabel) await github.rest.issues.removeLabel({ ...ref, name: LABEL }).catch(() => {});
+                await github.rest.issues.addLabels({ ...ref, labels: [LABEL] });
+                await setStatus(it.id, STATUS_WORKING);
+                core.info(`Started ${iss.repository.name}#${iss.number}`);
+              } else if (status(it) === STATUS_WORKING &&
+                         iss.closedByPullRequestsReferences.nodes.some(pr => pr.state === 'OPEN')) {
+                await setStatus(it.id, STATUS_REVIEW);
+                if (hasLabel) await github.rest.issues.removeLabel({ ...ref, name: LABEL }).catch(() => {});
+                core.info(`Ready for review ${iss.repository.name}#${iss.number}`);
+              }
+            }

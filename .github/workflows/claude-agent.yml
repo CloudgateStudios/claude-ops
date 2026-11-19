@@ -1,0 +1,71 @@
+# Reusable Claude agent workflow for every CloudgateStudios repo.
+# Lives in CloudgateStudios/claude-ops and is called by a small claude.yml in each repo.
+#
+# Triggers (decided by the caller, re-checked by the action):
+#   - add the `claude` label to an issue           -> Claude implements it and opens a PR
+#   - mention @claude in an issue / PR comment      -> Claude answers or makes changes
+#   - leave a review on a Claude PR that mentions @claude -> Claude revises
+#
+# Auth: set ONE of these as an org (or repo) Actions secret:
+#   CLAUDE_CODE_OAUTH_TOKEN  (from `claude setup-token`, bills your Claude subscription)
+#   ANTHROPIC_API_KEY        (bills the Anthropic API)
+
+name: Claude agent (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Model for Claude to use
+        type: string
+        default: claude-opus-5-5
+      max_turns:
+        description: Upper bound on agent turns per run
+        type: number
+        default: 40
+      timeout_minutes:
+        type: number
+        default: 45
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+
+jobs:
+  claude:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "@claude"
+          label_trigger: "claude"
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh issue view:*)"
+            --append-system-prompt "You are working a ticket for Cloudgate Studios.
+            Read CLAUDE.md first if it exists and follow its build and test commands.
+            Work on a new branch named claude/issue-<number>-<short-slug>.
+            Keep the change scoped to the ticket's acceptance criteria.
+            Run the project's tests/linters before finishing.
+            When done, open a pull request with gh pr create whose body starts with
+            'Closes #<issue number>', summarises what changed, and lists anything
+            you were unsure about so Tom can check it in review.
+            If the ticket is too vague to implement, ask clarifying questions in an
+            issue comment instead of guessing."
