@@ -31,6 +31,9 @@ on:
         required: false
       ANTHROPIC_API_KEY:
         required: false
+      CLAUDE_BOARD_TOKEN:
+        description: Fine-grained PAT Claude uses for `gh pr create` (PRs opened this way trigger CI)
+        required: false
 
 jobs:
   claude:
@@ -50,6 +53,10 @@ jobs:
 
       - name: Run Claude
         uses: anthropics/claude-code-action@v1
+        env:
+          # Lets Claude's `gh pr create` open the PR itself. Falls back to the job token
+          # (PR still opens, but CI checks won't run on it) if the PAT isn't available.
+          GH_TOKEN: ${{ secrets.CLAUDE_BOARD_TOKEN || github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -64,7 +71,9 @@ jobs:
             Work on a new branch named claude/issue-<number>-<short-slug>.
             Keep the change scoped to the ticket's acceptance criteria.
             Run the project's tests/linters before finishing.
-            When done, open a pull request with gh pr create whose body starts with
+            When done, push the branch and open the pull request yourself with
+            gh pr create --base main --head <your branch> (do not just post a
+            'Create PR' link). The PR body must start with
             'Closes #<issue number>', summarises what changed, and lists anything
             you were unsure about so Tom can check it in review.
             If the ticket is too vague to implement, ask clarifying questions in an
