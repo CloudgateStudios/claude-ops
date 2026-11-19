@@ -1,6 +1,6 @@
 # Drives Claude from the org project board.
 #
-# Every 5 minutes this looks at the CloudgateStudios project board and:
+# Every 30 minutes (at :07 and :37) this looks at the CloudgateStudios project board and:
 #   0. Adds every open issue from any CloudgateStudios repo that isn't on the board yet,
 #      in the STATUS_NEW column (covers new repos automatically)
 #   1. "Ready for Agent"   -> adds the `claude` label to the issue (which wakes the
@@ -24,7 +24,7 @@ name: Board -> Claude
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 concurrency:
