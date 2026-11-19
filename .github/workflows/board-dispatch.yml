@@ -9,6 +9,7 @@
 #                           card to "Needs Review" and removes the `claude` label
 #
 # GitHub Actions has no trigger for project-board moves, hence the poll.
+# Logs print counts only, so repo/issue names stay out of public run logs.
 #
 # Setup:
 #   - Org variable  CLAUDE_PROJECT_NUMBER = the board's number (from its URL)
@@ -122,7 +123,7 @@ jobs:
                   }`, { p: project.id, c: iss.id });
                 if (STATUS_NEW) await setStatus(res.addProjectV2ItemById.item.id, STATUS_NEW);
                 onBoard.add(iss.id); added++;
-                core.info(`Added ${iss.repository.name}#${iss.number} to the board`);
+                
               }
               after = r.search.pageInfo.hasNextPage ? r.search.pageInfo.endCursor : null;
             } while (after);
@@ -131,6 +132,7 @@ jobs:
             const status = (it) => it.fieldValueByName?.name ?? '';
             const issues = items.filter(it => it.content?.__typename === 'Issue' && it.content.state === 'OPEN');
 
+            let started = 0, reviewed = 0;
             for (const it of issues) {
               const iss = it.content;
               const ref = { owner: ORG, repo: iss.repository.name, issue_number: iss.number };
@@ -141,11 +143,12 @@ jobs:
                 if (hasLabel) await github.rest.issues.removeLabel({ ...ref, name: LABEL }).catch(() => {});
                 await github.rest.issues.addLabels({ ...ref, labels: [LABEL] });
                 await setStatus(it.id, STATUS_WORKING);
-                core.info(`Started ${iss.repository.name}#${iss.number}`);
+                started++;
               } else if (status(it) === STATUS_WORKING &&
                          iss.closedByPullRequestsReferences.nodes.some(pr => pr.state === 'OPEN')) {
                 await setStatus(it.id, STATUS_REVIEW);
                 if (hasLabel) await github.rest.issues.removeLabel({ ...ref, name: LABEL }).catch(() => {});
-                core.info(`Ready for review ${iss.repository.name}#${iss.number}`);
+                reviewed++;
               }
             }
+            core.info(`Started ${started}, moved to review ${reviewed}`);
